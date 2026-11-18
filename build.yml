@@ -1,0 +1,160 @@
+name: Build FPTN (no Google, no logging)
+
+on:
+  workflow_dispatch:
+    inputs:
+      abis:
+        description: "ABIs, comma separated (arm64-v8a is enough for any modern phone)"
+        default: "arm64-v8a"
+  push:
+    branches: [main]
+
+concurrency:
+  group: fptn-build
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: fptn-project/FptnClient-Android
+  # Pinned commit of the upstream app. The native library is pinned by it as a submodule.
+  UPSTREAM_SHA: a571e738b2a6bcb2ce2a5aa65e82f84415474214
+  ABIS: ${{ inputs.abis || 'arm64-v8a' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell || true
+          df -h /
+
+      - name: Checkout the patch kit (this repository)
+        uses: actions/checkout@v5
+        with:
+          path: kit
+
+      - name: Checkout upstream FPTN Android client (+ native library submodule)
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_SHA }}
+          submodules: recursive
+          path: src
+
+      - name: Apply patch (remove Google services and logging)
+        run: python3 -I kit/patch/apply_patch.py src
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Android SDK packages
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          PKGS=("platforms;android-36" "build-tools;36.0.0" "ndk;28.1.13356709" "cmake;3.22.1")
+          if ! "$SDKMANAGER" "${PKGS[@]}"; then
+            sudo -E env "PATH=$PATH" "$SDKMANAGER" "${PKGS[@]}"
+          fi
+
+      - name: Install conan
+        run: |
+          python -m pip install --upgrade pip
+          pip install "conan<3" numpy
+
+      - name: Restore conan cache
+        id: conan-cache
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.conan2
+          key: conan-${{ runner.os }}-${{ env.ABIS }}-${{ hashFiles('kit/patch/**') }}
+          restore-keys: |
+            conan-${{ runner.os }}-${{ env.ABIS }}-
+
+      - name: Conan profile
+        run: conan profile detect -f
+
+      - name: Prepare signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          SECRET_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          SECRET_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          KS="$RUNNER_TEMP/fptn.jks"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$KS"
+            ALIAS="$SECRET_ALIAS"
+            PASS="$SECRET_PASSWORD"
+          else
+            # No secrets set: a one-off key is generated for this build.
+            ALIAS="fptn"
+            PASS="$(openssl rand -hex 16)"
+            keytool -genkeypair -keystore "$KS" -alias "$ALIAS" -keyalg RSA -keysize 4096 \
+              -validity 36500 -storepass "$PASS" -keypass "$PASS" -dname "CN=FPTN build"
+          fi
+          echo "::add-mask::$PASS"
+          {
+            echo "KEYSTORE_PATH=$KS"
+            echo "KEY_ALIAS=$ALIAS"
+            echo "KEY_PASSWORD=$PASS"
+            echo "STORE_PASSWORD=$PASS"
+          } >> "$GITHUB_ENV"
+
+      - name: Build APK
+        working-directory: src
+        env:
+          RELEASE_VERSION: 0.0.0.${{ github.run_number }}
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x gradlew
+          ./gradlew assembleRelease \
+            -PfptnAbis="$ABIS" \
+            -PfptnConanBuildTypes=RelWithDebInfo \
+            --no-daemon --stacktrace
+
+      - name: Trim conan cache before saving
+        if: always()
+        run: conan cache clean "*" --source --build --temp || true
+
+      - name: Save conan cache
+        if: always() && steps.conan-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.conan2
+          key: conan-${{ runner.os }}-${{ env.ABIS }}-${{ hashFiles('kit/patch/**') }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v5
+        with:
+          name: fptn-clean-apk
+          path: src/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Verify the APK is clean
+        run: |
+          set -e
+          cd src/app/build/outputs/apk/release
+          AAPT2="$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 | tail -n 1)"
+          for apk in *.apk; do
+            echo "=== $apk"
+            rm -rf "$RUNNER_TEMP/x" && mkdir -p "$RUNNER_TEMP/x" && unzip -q -o "$apk" -d "$RUNNER_TEMP/x"
+            if grep -laE "com/google/firebase|com/google/android/gms|com/elvishew|crashlytics" "$RUNNER_TEMP"/x/classes*.dex; then
+              echo "FAIL: Google/Firebase/XLog classes found in $apk"; exit 1
+            fi
+            echo "no Firebase / Play Services / XLog classes in the dex files"
+            echo "--- permissions:"
+            "$AAPT2" dump permissions "$apk" | grep -E "^uses-permission" || true
+            echo "--- native libraries:"
+            ls "$RUNNER_TEMP/x/lib"
+          done
